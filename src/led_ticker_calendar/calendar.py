@@ -11,6 +11,7 @@ import asyncio
 import logging
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, Self
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -27,6 +28,7 @@ from led_ticker.plugin import (
     DrawResult,
     Font,
     FrameAwareBase,
+    ScaledCanvas,
     TickerMessage,
     TwoRowMessage,
     Widget,
@@ -36,9 +38,12 @@ from led_ticker.plugin import (
     compute_cursor,
     count_text_chars,
     draw_with_emoji,
+    font_line_height_logical,
     format_clock,
     make_color,
     measure_width,
+    resolve_band_heights,
+    resolve_font,
     run_monitor_loop,
     spawn_tracked,
 )
@@ -61,6 +66,10 @@ _SEP = " · "
 _MAX_OCCURRENCES = 2000
 
 _SUBHOURLY_FREQS = frozenset({"SECONDLY", "MINUTELY"})
+
+# ics_url schemes that are network feeds — never path-checked by the local-file
+# existence warning (mirrors core validate._ICS_NETWORK_SCHEMES, rule 54).
+_ICS_NETWORK_SCHEMES = ("http://", "https://", "webcal://", "webcals://")
 
 
 def _rrule_is_subhourly(rrule: Any) -> bool:
@@ -961,6 +970,169 @@ class Calendar:
             if val is not None and (isinstance(val, bool) or not isinstance(val, int)):
                 errors.append(f"{key} must be an integer")
         return errors
+
+    @classmethod
+    def validate_config_warnings(cls, cfg, ctx):
+        """Advisory preflight warnings (surfaced by ``led-ticker validate``).
+
+        ``ctx`` is a ``led_ticker.plugin.ValidationContext``. Returns warning
+        strings; never raises (the core runner is error-isolated regardless).
+        """
+        warnings: list[str] = []
+        # 1. ics_url local-file existence
+        warnings.extend(cls._warn_missing_ics_path(cfg, ctx))
+        # 2. two_row font-fit  (warning; runtime still hard-raises)
+        # 3. two_row held-top overflow
+        if cfg.get("layout") == "two_row":
+            warnings.extend(cls._warn_two_row_band_fit(cfg, ctx))
+            warnings.extend(cls._warn_two_row_held_top_overflow(cfg, ctx))
+        return warnings
+
+    @staticmethod
+    def _warn_missing_ics_path(cfg, ctx):
+        """Warn when a LOCAL ``ics_url`` (file:// or bare path) does not exist.
+
+        Mirrors core ``validate._check_calendar_ics_paths`` (rule 54). Network
+        feeds (http(s)://, webcal(s)://) are never path-checked. The unfilled-
+        placeholder case is a hard error from ``validate_config``, so it does not
+        double-report here.
+        """
+        ics_url = cfg.get("ics_url")
+        if not isinstance(ics_url, str) or not ics_url.strip():
+            return []  # required-field error handled by validate_config
+        if ics_url.lower().startswith(_ICS_NETWORK_SCHEMES):
+            return []  # network feed — no path check
+        raw = ics_url
+        if raw.startswith("file://"):
+            raw = raw[len("file://") :]
+            if raw.startswith("localhost/"):
+                raw = raw[len("localhost") :]  # RFC 8089 file://localhost/abs
+            raw = unquote(raw)
+        candidate = Path(raw).expanduser()
+        resolved = (
+            candidate
+            if candidate.is_absolute()
+            else (ctx.config_dir / candidate).resolve()
+        )
+        if resolved.exists():
+            return []
+        return [
+            f"calendar ics_url path {ics_url!r} does not exist "
+            f"(resolved to {resolved}). It must be present at runtime. If a job "
+            f"writes the .ics file later this is just a heads-up; otherwise fix "
+            f"the path or use an https:// feed URL."
+        ]
+
+    @staticmethod
+    def _warn_two_row_band_fit(cfg, ctx):
+        """Warn when the calendar's two_row font won't fit a per-row band.
+
+        Mirrors the ``wtype == "calendar"`` branch of core
+        ``validate._check_band_layout`` (rule 22). In core these were ERRORS; here
+        they are WARNINGS — the runtime ``TwoRowMessage.draw`` still hard-raises,
+        so correctness is preserved; this is a preflight heads-up.
+
+        The calendar font defaults to FONT_DEFAULT (6x12), but ``two_row``
+        substitutes FONT_SMALL at runtime (6x12 can't fit any two_row band); that
+        substitution is mirrored here so validate matches runtime.
+        """
+        warnings: list[str] = []
+        content_h = ctx.content_height
+        scale = ctx.scale
+        top_row_height = cfg.get("top_row_height")
+        try:
+            top_h, bottom_h = resolve_band_heights(content_h, top_row_height)
+        except ValueError as e:
+            # top_row_height >= content_height leaves the bottom row zero rows, so
+            # TwoRowMessage.draw() raises at runtime. Surface as a heads-up.
+            return [
+                f"{e} Set top_row_height < the section's content_height "
+                "(omit it for the default 50/50 split)."
+            ]
+
+        font_name = cfg.get("font")
+        font_size = cfg.get("font_size")
+        try:
+            if font_name is None:
+                font = FONT_SMALL
+            else:
+                font = resolve_font(font_name, size=font_size)
+        except ValueError:
+            # font resolution error is surfaced elsewhere (validate_config /
+            # build checks); nothing to warn about here.
+            return []
+        # Mirror the runtime substitution: a calendar two_row whose font resolves
+        # to FONT_DEFAULT (6x12) renders with FONT_SMALL.
+        if font is FONT_DEFAULT:
+            font = FONT_SMALL
+
+        for label, band_h in (("top", top_h), ("bottom", bottom_h)):
+            lh = font_line_height_logical(font, scale)
+            if lh > band_h:
+                warnings.append(
+                    f"{label} font line-height ({lh} logical rows) exceeds the "
+                    f"per-row band ({band_h} rows on a {content_h}-tall canvas). "
+                    "Pick a smaller font_size, raise the section's content_height, "
+                    "or adjust top_row_height for an asymmetric split."
+                )
+        return warnings
+
+    @staticmethod
+    def _warn_two_row_held_top_overflow(cfg, ctx):
+        """Warn when the held day+time row is wider than the logical canvas.
+
+        Mirrors the ``wtype == "calendar"`` branch of core
+        ``validate._check_held_top_text_overflow``. The held top row clips
+        silently on overflow (no scroll); the widest representative phrase is
+        measured against the logical canvas width. Custom strftime time_formats
+        have unknown width, so they are skipped.
+        """
+        # ScaledCanvas requires content_height × scale ≤ panel_height; if the
+        # section violates that, core flags it as rule 1 (error) — skip the width
+        # check here (mirrors core).
+        if ctx.content_height * ctx.scale > ctx.panel_height:
+            return []
+        tf = cfg.get("time_format", "12h")
+        if not isinstance(tf, str) or "%" in tf:
+            return []  # custom strftime: unknown width
+        top_text = "Tomorrow 23:59" if tf == "24h" else "Tomorrow 12:00 PM"
+
+        top_row_height = cfg.get("top_row_height")
+        try:
+            top_h, _ = resolve_band_heights(ctx.content_height, top_row_height)
+        except ValueError:
+            return []  # zero-row bottom band: handled by the band-fit warning
+
+        font_name = cfg.get("font")
+        font_size = cfg.get("font_size")
+        try:
+            if font_name is None:
+                font = FONT_SMALL
+            else:
+                font = resolve_font(font_name, size=font_size)
+        except ValueError:
+            return []  # font resolution error caught elsewhere
+        # Mirror the runtime FONT_DEFAULT -> FONT_SMALL substitution.
+        if font is FONT_DEFAULT:
+            font = FONT_SMALL
+
+        real = SimpleNamespace(width=ctx.panel_width, height=ctx.panel_height)
+        canvas = ScaledCanvas(real, scale=ctx.scale, content_height=ctx.content_height)
+        canvas_w = canvas.width
+        # EMOJI_ROW_CAP = 8 in core; the held phrase has no inline emoji so the
+        # cap only bounds a hypothetical sprite. max(8, top_h) mirrors core.
+        emoji_cap = max(8, top_h)
+        width = measure_width(font, top_text, canvas, max_emoji_height=emoji_cap)
+        if width <= canvas_w:
+            return []
+        overflow = width - canvas_w
+        return [
+            f"two_row held day+time row clips on this {canvas_w}-wide logical "
+            f"canvas: the widest phrase ({top_text!r}) is {width} logical px "
+            f"({overflow} px over). The top row is held (no scroll), so long "
+            "'when' phrases crop. Lower the section's scale (e.g. scale = 2 gives "
+            "a wider logical canvas) or use a narrower font/font_size."
+        ]
 
     @classmethod
     async def start(
