@@ -1040,6 +1040,10 @@ class Calendar:
         content_h = ctx.content_height
         scale = ctx.scale
         top_row_height = cfg.get("top_row_height")
+        if top_row_height is not None and (
+            isinstance(top_row_height, bool) or not isinstance(top_row_height, int)
+        ):
+            return []  # non-int: surfaced as an error by validate_config
         try:
             top_h, bottom_h = resolve_band_heights(content_h, top_row_height)
         except ValueError as e:
@@ -1098,6 +1102,10 @@ class Calendar:
         top_text = "Tomorrow 23:59" if tf == "24h" else "Tomorrow 12:00 PM"
 
         top_row_height = cfg.get("top_row_height")
+        if top_row_height is not None and (
+            isinstance(top_row_height, bool) or not isinstance(top_row_height, int)
+        ):
+            return []  # non-int: surfaced as an error by validate_config
         try:
             top_h, _ = resolve_band_heights(ctx.content_height, top_row_height)
         except ValueError:
@@ -1119,8 +1127,11 @@ class Calendar:
         real = SimpleNamespace(width=ctx.panel_width, height=ctx.panel_height)
         canvas = ScaledCanvas(real, scale=ctx.scale, content_height=ctx.content_height)
         canvas_w = canvas.width
-        # EMOJI_ROW_CAP = 8 in core; the held phrase has no inline emoji so the
-        # cap only bounds a hypothetical sprite. max(8, top_h) mirrors core.
+        # EMOJI_ROW_CAP = 8 in core (the 8x8 lo-res sprite height — a physical
+        # constant unlikely to change). The held phrase has no inline emoji, so this
+        # cap only bounds a hypothetical sprite and never affects the measured width.
+        # Hardcoded because EMOJI_ROW_CAP is not exported from led_ticker.plugin;
+        # fast-follow: export it so plugins can reference it symbolically.
         emoji_cap = max(8, top_h)
         width = measure_width(font, top_text, canvas, max_emoji_height=emoji_cap)
         if width <= canvas_w:

@@ -184,6 +184,20 @@ def test_two_row_top_row_height_ge_content_warns(tmp_path):
     assert warnings  # zero-row bottom band surfaces a warning
 
 
+def test_two_row_non_int_top_row_height_does_not_raise(tmp_path):
+    # A string top_row_height is a validate_config ERROR; validate_config_warnings
+    # must return [] without raising (never-raises contract).
+    ctx = _ctx(tmp_path)
+    cfg = {
+        "type": "calendar",
+        "ics_url": _V,
+        "layout": "two_row",
+        "top_row_height": "bad",
+    }
+    result = Calendar.validate_config_warnings(cfg, ctx)
+    assert result == []
+
+
 def test_two_row_held_top_clips_on_narrow_bigsign_canvas(tmp_path):
     # Bigsign-like: scale=4, content_height=16, panel 256x64 -> logical canvas is
     # only 64px wide. "Tomorrow 12:00 PM" overflows -> held-top warning.
